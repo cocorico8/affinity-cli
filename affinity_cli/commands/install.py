@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from rich.console import Console
 from rich.panel import Panel
@@ -12,8 +12,11 @@ from rich.table import Table
 from affinity_cli import config
 from affinity_cli.core.affinity_installer import AffinityInstaller
 from affinity_cli.core.config_loader import ResolvedConfig
+from affinity_cli.core.exceptions import AffinityCliError, InstallationError
 from affinity_cli.core.installer_scanner import InstallerCandidate, InstallerScanner
-from affinity_cli.core.wine_executor import WineExecutor, WineExecutorError
+from affinity_cli.core.prefix_manager import PrefixManager
+from affinity_cli.core.wine_executor import WineExecutor
+from affinity_cli.core.wine_manager import WineManager
 
 
 def run_install(
@@ -34,8 +37,11 @@ def run_install(
         )
     )
 
+    # 1. Scan for installers
     scanner = InstallerScanner(settings.installers_path)
-    selection: Dict[str, InstallerCandidate] = scanner.select(product_targets, settings.default_version)
+    selection: Dict[str, InstallerCandidate] = scanner.select(
+        product_targets, settings.default_version
+    )
     missing = [product for product in product_targets if product not in selection]
 
     if missing:
@@ -57,6 +63,7 @@ def run_install(
 
     _render_install_plan(selection, console, settings.default_version)
 
+    # 2. Confirmation
     if dry_run:
         console.print(
             Panel.fit(
@@ -69,32 +76,54 @@ def run_install(
             console.print("[yellow]Installation cancelled by user.[/yellow]")
             return
 
-    executor = WineExecutor(
-        settings.wine_prefix,
-        dry_run=dry_run,
-        silent=silent,
-    )
-
+    # 3. Initialize Service Layer
     try:
-        executor.ensure_prefix()
-    except WineExecutorError as exc:
-        console.print(f"[red]Wine prefix error:[/red] {exc}")
+        # Resolve Wine binary (Custom > System)
+        wine_manager = WineManager()
+        wine_bin = wine_manager.get_wine_path()
+
+        prefix_manager = PrefixManager(settings.wine_prefix)
+        
+        executor = WineExecutor(
+            settings.wine_prefix,
+            wine_binary_path=wine_bin,
+            dry_run=dry_run,
+            silent=silent,
+        )
+        
+        installer_service = AffinityInstaller(executor, prefix_manager)
+        
+    except AffinityCliError as e:
+        console.print(f"[red]Initialization error:[/red] {e}")
         return
 
-    results = []
+    # 4. Execution Loop
+    results: List[Tuple[str, bool, str]] = []
+    
     for product in product_targets:
         candidate = selection.get(product)
         if not candidate:
             continue
-        console.print(
-            f"\n[bold]Installing {config.AFFINITY_PRODUCTS[product]['name']}[/bold]"
-        )
+            
+        product_name = config.PRODUCT_NAMES[product]
+        console.print(f"\n[bold]Installing {product_name}[/bold]")
+        
         try:
-            executor.run_installer(candidate.path, candidate.version_type)
-            results.append((product, True, "Installer completed"))
-        except WineExecutorError as exc:
+            installer_service.install(
+                installer_path=candidate.path,
+                product=product,
+                version_type=candidate.version_type
+            )
+            results.append((product, True, "Installation verified"))
+        except AffinityCliError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
             results.append((product, False, str(exc)))
+        except Exception as exc:
+            # Catch-all for unexpected runtime errors
+            console.print(f"[red]Unexpected error:[/red] {exc}")
+            results.append((product, False, f"Unexpected error: {exc}"))
 
+    # 5. Summary
     _post_install_summary(results, settings, console, dry_run)
 
 
@@ -111,7 +140,7 @@ def _render_install_plan(
 
     for product, candidate in selection.items():
         table.add_row(
-            config.AFFINITY_PRODUCTS[product]["name"],
+            config.PRODUCT_NAMES[product],
             candidate.version_label,
             str(candidate.path),
             candidate.human_size,
@@ -121,7 +150,7 @@ def _render_install_plan(
 
 
 def _post_install_summary(
-    results: List[tuple],
+    results: List[Tuple[str, bool, str]],
     settings: ResolvedConfig,
     console: Console,
     dry_run: bool,
@@ -139,28 +168,23 @@ def _post_install_summary(
         return
 
     if successes:
-        installer = AffinityInstaller(prefix_path=settings.wine_prefix)
-        verified = []
-        for product, *_ in successes:
-            if installer.verify_installation(product):
-                verified.append(config.AFFINITY_PRODUCTS[product]["name"])
-        if verified:
-            console.print(
-                Panel.fit(
-                    "\n".join(
-                        [
-                            "[green]Installation complete![/green]",
-                            f"Verified: {', '.join(verified)}",
-                            f"Wine prefix: {settings.wine_prefix}",
-                        ]
-                    ),
-                    border_style="green",
-                )
+        success_names = [config.PRODUCT_NAMES[product] for product, _, _ in successes]
+        console.print(
+            Panel.fit(
+                "\n".join(
+                    [
+                        "[green]Batch completed![/green]",
+                        f"Installed: {', '.join(success_names)}",
+                        f"Wine prefix: {settings.wine_prefix}",
+                    ]
+                ),
+                border_style="green",
             )
+        )
 
     if failures:
         failure_lines = [
-            f"{config.AFFINITY_PRODUCTS[product]['name']}: {message}"
+            f"{config.PRODUCT_NAMES[product]}: {message}"
             for product, _, message in failures
         ]
         console.print(

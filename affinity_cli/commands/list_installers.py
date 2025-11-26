@@ -9,6 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from affinity_cli import config
+from affinity_cli.core.config_loader import ResolvedConfig
 from affinity_cli.core.installer_scanner import InstallerScanner
 
 
@@ -56,7 +57,7 @@ def run_list_installers(
 
     for candidate in candidates:
         table.add_row(
-            config.AFFINITY_PRODUCTS[candidate.product]["name"],
+            config.PRODUCT_NAMES.get(candidate.product, candidate.product),
             candidate.version_type,
             candidate.version_label,
             str(candidate.path),

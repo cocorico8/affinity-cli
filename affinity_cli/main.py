@@ -109,6 +109,37 @@ def install_cmd(
     )
 
 
+@cli.command(name="uninstall")
+@click.argument("target", type=click.Choice(["photo", "designer", "publisher", "all"], case_sensitive=False))
+@click.option("--prefix", "prefix_path", type=click.Path(file_okay=False), help="Wine prefix override")
+@click.option("--silent", is_flag=True, help="Skip confirmation prompts")
+@click.pass_context
+def uninstall_cmd(
+    ctx: click.Context,
+    target: str,
+    prefix_path: Optional[str],
+    silent: bool,
+) -> None:
+    """Uninstall Affinity products."""
+
+    loader: ConfigLoader = ctx.obj["config_loader"]
+    settings = loader.derive(prefix_path=prefix_path)
+
+    if target.lower() == "all":
+        product_targets: List[str] = list(config.AFFINITY_PRODUCTS.keys())
+    else:
+        product_targets = [target.lower()]
+
+    from affinity_cli.commands.uninstall import run_uninstall
+
+    run_uninstall(
+        product_targets=product_targets,
+        settings=settings,
+        console=ctx.obj["console"],
+        silent=silent,
+    )
+
+
 @cli.command(name="status")
 @click.option("--prefix", "prefix_path", type=click.Path(file_okay=False), help="Inspect a specific Wine prefix")
 @click.option("--installers", "installers_path", type=click.Path(file_okay=False), help="Override installer directory")

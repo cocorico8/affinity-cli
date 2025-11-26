@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Literal
 
 # Project metadata ---------------------------------------------------------
 
@@ -21,7 +21,9 @@ DEFAULT_WINE_INSTALL = HOME_DIR / ".local" / "wine"
 
 # Versions -----------------------------------------------------------------
 
-DEFAULT_INSTALLER_VERSION = "v2"
+VersionLiteral = Literal["v1", "v2"]
+
+DEFAULT_INSTALLER_VERSION: VersionLiteral = "v2"
 SUPPORTED_INSTALLER_VERSIONS = ("v1", "v2")
 
 # Wine ---------------------------------------------------------------------
@@ -52,6 +54,13 @@ AFFINITY_PRODUCTS: Dict[str, Dict[str, str]] = {
         "exe_name": "Publisher.exe",
         "install_path": "Program Files/Affinity/Publisher 2",
     },
+}
+
+# Derived Constants --------------------------------------------------------
+
+# Simple mapping for legacy compatibility and easy display
+PRODUCT_NAMES = {
+    key: val["name"] for key, val in AFFINITY_PRODUCTS.items()
 }
 
 # Dependencies by category -------------------------------------------------

@@ -1,372 +1,169 @@
 """
 Affinity Installer Module
-Install Affinity products into Wine prefix
+Orchestrates installation, verification, and management of Affinity products.
 """
 
-import subprocess
-import os
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import List, Optional
 
 from affinity_cli import config
-from affinity_cli.core.installer_scanner import InstallerScanner
+from affinity_cli.core.exceptions import (
+    InstallationError,
+    InstallerNotFoundError,
+    PrefixError,
+    VerificationError,
+)
+from affinity_cli.core.logger import logger
 from affinity_cli.core.prefix_manager import PrefixManager
-from affinity_cli.core.wine_manager import WineManager
+from affinity_cli.core.wine_executor import WineExecutionError, WineExecutor
 
 
 class AffinityInstaller:
-    """Install and manage Affinity products"""
-    
-    # Product detection patterns
-    PRODUCT_PATTERNS = {
-        "photo": r"(?i)photo.*\.exe",
-        "designer": r"(?i)designer.*\.exe",
-        "publisher": r"(?i)publisher.*\.exe",
-    }
-    
-    def __init__(self,
-                 prefix_path: Optional[Path] = None,
-                 wine_manager: Optional[WineManager] = None):
-        """
-        Initialize Affinity Installer
-        
-        Args:
-            prefix_path: Wine prefix path (default: ~/.wine-affinity)
-            wine_manager: WineManager instance (optional)
-        """
-        self.prefix_path = Path(prefix_path) if prefix_path else config.DEFAULT_WINE_PREFIX
-        self.wine_manager = wine_manager or WineManager()
-        self.wine_path = self.wine_manager.get_wine_path()
-        
-        if not self.wine_path:
-            raise RuntimeError("Wine not found. Install Wine first.")
-        
-        self.prefix_manager = PrefixManager(prefix_path=self.prefix_path, wine_manager=self.wine_manager)
-    
-    def detect_installer(
+    """
+    High-level orchestrator for Affinity product management.
+    Delegates low-level operations to WineExecutor and PrefixManager.
+    """
+
+    def __init__(
         self,
-        search_path: Path,
-        version: str = config.DEFAULT_INSTALLER_VERSION,
-    ) -> Dict[str, Optional[Path]]:
+        wine_executor: WineExecutor,
+        prefix_manager: PrefixManager,
+    ):
+        self.wine_executor = wine_executor
+        self.prefix_manager = prefix_manager
+        self.prefix_path = prefix_manager.prefix_path
+
+    def install(self, installer_path: Path, product: str, version_type: str = "v2") -> None:
         """
-        Detect Affinity installer files in a directory
-        
+        Install an Affinity product.
+
         Args:
-            search_path: Directory to search for installers
-        
-        Returns:
-            Dictionary mapping product names to installer paths
-        """
-        if not search_path.exists() or not search_path.is_dir():
-            return {}
-        
-        scanner = InstallerScanner(search_path)
-        normalized_version = (
-            version if version in config.SUPPORTED_INSTALLER_VERSIONS else config.DEFAULT_INSTALLER_VERSION
-        )
-        selection = scanner.select(config.AFFINITY_PRODUCTS.keys(), normalized_version)
-        return {product: candidate.path for product, candidate in selection.items()}
-    
-    def install_affinity_product(self, 
-                                installer_path: Path, 
-                                product: str) -> Tuple[bool, str]:
-        """
-        Install an Affinity product
-        
-        Args:
-            installer_path: Path to installer .exe
-            product: Product name (photo, designer, publisher)
-        
-        Returns:
-            Tuple of (success, message)
+            installer_path: Path to the installer executable.
+            product: Product identifier (photo, designer, publisher).
+            version_type: Version string ('v1' or 'v2') for argument selection.
+
+        Raises:
+            InstallerNotFoundError: If installer file is missing.
+            InstallationError: If the installation process fails.
+            VerificationError: If installation completes but files are missing.
         """
         if not installer_path.exists():
-            return False, f"Installer not found: {installer_path}"
-        
+            raise InstallerNotFoundError(f"Installer not found: {installer_path}")
+
         if product not in config.AFFINITY_PRODUCTS:
-            return False, f"Unknown product: {product}"
-        
-        if not self.prefix_manager.prefix_exists():
-            return False, "Wine prefix does not exist. Create it first."
-        
+            raise InstallationError(f"Unknown product: {product}")
+
         product_name = config.AFFINITY_PRODUCTS[product]["name"]
-        print(f"Installing {product_name}...")
-        print(f"Installer: {installer_path}")
-        print("This may take 5-10 minutes...")
-        
+        logger.info(f"Installing {product_name}...")
+
+        # Ensure prefix exists
         try:
-            env = self._get_wine_env()
-            
-            # Silent installation flags (common for Windows installers)
-            # /S = silent, /q = quiet, /qn = quiet no UI, /VERYSILENT = InnoSetup silent
-            install_flags = ["/S", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
-            
-            # Try installation with different flag combinations
-            for flags in [install_flags, ["/S"], ["/VERYSILENT"]]:
-                result = subprocess.run(
-                    [str(self.wine_path), str(installer_path)] + flags,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=900  # 15 minutes
-                )
-                
-                # Some installers return 0 even on silent mode rejection
-                # Check if files were actually installed
-                if self._verify_installation_files(product):
-                    break
-            
-            # Verify installation
-            if not self.verify_installation(product):
-                return False, f"Installation completed but verification failed. Check {self.prefix_path}"
-            
-            return True, f"{product_name} installed successfully"
+            self.wine_executor.ensure_prefix()
+        except WineExecutionError as e:
+            raise PrefixError(f"Failed to initialize Wine prefix: {e}") from e
+
+        # Run installer
+        try:
+            logger.info(f"Running installer: {installer_path}")
+            self.wine_executor.run_installer(installer_path, version_type)
+        except WineExecutionError as e:
+            # Some installers return non-zero even on success or partial success.
+            # We log it but proceed to verification to be sure.
+            logger.warning(f"Installer process reported an error: {e}")
+            logger.warning("Attempting to verify installation despite error...")
+
+        # Verify
+        if not self.is_installed(product):
+            raise VerificationError(
+                f"Installation of {product_name} failed. Executable not found in prefix."
+            )
         
-        except subprocess.TimeoutExpired:
-            return False, f"{product_name} installation timed out after 15 minutes"
-        except Exception as e:
-            return False, f"Installation error: {str(e)}"
-    
-    def verify_installation(self, product: str) -> bool:
+        logger.info(f"Successfully installed {product_name}.")
+
+    def uninstall(self, product: str) -> None:
         """
-        Verify that an Affinity product is installed
+        Uninstall an Affinity product.
         
-        Args:
-            product: Product name (photo, designer, publisher)
-        
-        Returns:
-            True if product is installed and executable exists
+        Raises:
+            InstallationError: If uninstallation fails.
         """
-        product_path = self.get_product_path(product)
-        return product_path is not None and product_path.exists()
-    
+        if not self.is_installed(product):
+            logger.warning(f"{product} is not installed.")
+            return
+
+        uninstaller_path = self._find_uninstaller(product)
+        if not uninstaller_path:
+            raise InstallationError(f"Uninstaller not found for {product}")
+
+        product_name = config.AFFINITY_PRODUCTS[product]["name"]
+        logger.info(f"Uninstalling {product_name}...")
+
+        try:
+            # Standard uninstaller arguments
+            args = [str(uninstaller_path), "/VERYSILENT", "/NORESTART"]
+            self.wine_executor.run_command(args)
+        except WineExecutionError as e:
+            raise InstallationError(f"Uninstallation failed: {e}") from e
+            
+        logger.info(f"Uninstalled {product_name}.")
+
+    def is_installed(self, product: str) -> bool:
+        """Check if a product is currently installed."""
+        path = self.get_product_path(product)
+        return path is not None and path.exists()
+
     def get_product_path(self, product: str) -> Optional[Path]:
-        """
-        Get path to installed product executable
-        
-        Args:
-            product: Product name (photo, designer, publisher)
-        
-        Returns:
-            Path to product .exe or None if not found
-        """
+        """Resolve the absolute path to the installed product executable."""
         if product not in config.AFFINITY_PRODUCTS:
             return None
-        
+
         product_info = config.AFFINITY_PRODUCTS[product]
-        install_path = product_info["install_path"]
+        install_path_fragment = product_info["install_path"]
         exe_name = product_info["exe_name"]
-        
-        # Check common installation locations
-        possible_paths = [
-            self.prefix_path / "drive_c" / install_path / exe_name,
-            self.prefix_path / "drive_c" / "Program Files" / "Affinity" / product.capitalize() / exe_name,
-            self.prefix_path / "drive_c" / "Program Files (x86)" / "Affinity" / product.capitalize() / exe_name,
+
+        # Common paths
+        drive_c = self.prefix_path / "drive_c"
+        candidates = [
+            drive_c / install_path_fragment / exe_name,
+            drive_c / "Program Files" / "Affinity" / product.capitalize() / exe_name,
+            drive_c / "Program Files (x86)" / "Affinity" / product.capitalize() / exe_name,
         ]
-        
-        for path in possible_paths:
+
+        for path in candidates:
             if path.exists():
                 return path
         
-        # Search recursively as fallback
-        affinity_dir = self.prefix_path / "drive_c" / "Program Files" / "Affinity"
-        if affinity_dir.exists():
-            for exe_path in affinity_dir.rglob(exe_name):
-                return exe_path
-        
+        # Deep search fallback
+        affinity_root = drive_c / "Program Files" / "Affinity"
+        if affinity_root.exists():
+            matches = list(affinity_root.rglob(exe_name))
+            if matches:
+                return matches[0]
+
         return None
-    
+
     def list_installed_products(self) -> List[str]:
-        """
-        List all installed Affinity products
-        
-        Returns:
-            List of installed product names
-        """
-        installed = []
-        
-        for product in config.AFFINITY_PRODUCTS.keys():
-            if self.verify_installation(product):
-                installed.append(product)
-        
-        return installed
-    
-    def launch_product(self, product: str) -> Tuple[bool, str]:
-        """
-        Launch an installed Affinity product
-        
-        Args:
-            product: Product name (photo, designer, publisher)
-        
-        Returns:
-            Tuple of (success, message)
-        """
-        if not self.verify_installation(product):
-            return False, f"{product} is not installed"
-        
-        product_path = self.get_product_path(product)
-        if not product_path:
-            return False, f"Could not find {product} executable"
-        
-        try:
-            env = self._get_wine_env()
+        """Return a list of product keys that are installed."""
+        return [p for p in config.AFFINITY_PRODUCTS if self.is_installed(p)]
+
+    def _find_uninstaller(self, product: str) -> Optional[Path]:
+        """Locate the uninstaller executable for a product."""
+        drive_c = self.prefix_path / "drive_c"
+        path_info = config.AFFINITY_PRODUCTS.get(product)
+        if not path_info:
+            return None
+
+        # Standard location
+        main_dir = drive_c / path_info["install_path"]
+        unins000 = main_dir / "unins000.exe"
+        if unins000.exists():
+            return unins000
+
+        # Fallback names
+        uninstall_exe = main_dir / "uninstall.exe"
+        if uninstall_exe.exists():
+            return uninstall_exe
             
-            # Launch in background
-            subprocess.Popen(
-                [str(self.wine_path), str(product_path)],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True
-            )
-            
-            product_name = config.AFFINITY_PRODUCTS[product]["name"]
-            return True, f"Launched {product_name}"
-        
-        except Exception as e:
-            return False, f"Launch error: {str(e)}"
-    
-    def uninstall_product(self, product: str) -> Tuple[bool, str]:
-        """
-        Uninstall an Affinity product
-        
-        Args:
-            product: Product name (photo, designer, publisher)
-        
-        Returns:
-            Tuple of (success, message)
-        """
-        if not self.verify_installation(product):
-            return False, f"{product} is not installed"
-        
-        # Find uninstaller
-        uninstall_paths = [
-            self.prefix_path / "drive_c" / config.AFFINITY_PRODUCTS[product]["install_path"] / "unins000.exe",
-            self.prefix_path / "drive_c" / "Program Files" / "Affinity" / product.capitalize() / "uninstall.exe",
-        ]
-        
-        uninstaller = None
-        for path in uninstall_paths:
-            if path.exists():
-                uninstaller = path
-                break
-        
-        if not uninstaller:
-            return False, f"Uninstaller not found for {product}"
-        
-        try:
-            env = self._get_wine_env()
-            
-            result = subprocess.run(
-                [str(self.wine_path), str(uninstaller), "/VERYSILENT", "/NORESTART"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            
-            product_name = config.AFFINITY_PRODUCTS[product]["name"]
-            return True, f"{product_name} uninstalled successfully"
-        
-        except subprocess.TimeoutExpired:
-            return False, "Uninstallation timed out"
-        except Exception as e:
-            return False, f"Uninstall error: {str(e)}"
-    
-    def _verify_installation_files(self, product: str) -> bool:
-        """
-        Check if product files exist (for installation verification)
-        
-        Args:
-            product: Product name
-        
-        Returns:
-            True if installation files are present
-        """
-        product_path = self.get_product_path(product)
-        return product_path is not None and product_path.exists()
-    
-    def _get_wine_env(self) -> Dict[str, str]:
-        """
-        Get environment variables for Wine execution
-        
-        Returns:
-            Dictionary of environment variables
-        """
-        env = os.environ.copy()
-        env["WINEPREFIX"] = str(self.prefix_path)
-        env["WINEDEBUG"] = "-all"
-        env["WINEARCH"] = "win64"
-        
-        # Add Wine bin to PATH
-        wine_bin_dir = self.wine_path.parent
-        env["PATH"] = f"{wine_bin_dir}:{env.get('PATH', '')}"
-        
-        return env
-
-
-def detect_installers(search_path: Path) -> Dict[str, Optional[Path]]:
-    """
-    Simple interface: Detect Affinity installers
-    
-    Args:
-        search_path: Directory to search
-    
-    Returns:
-        Dictionary of product -> installer path
-    """
-    installer = AffinityInstaller()
-    return installer.detect_installer(search_path)
-
-
-def install_product(installer_path: Path, product: str) -> Tuple[bool, str]:
-    """
-    Simple interface: Install Affinity product
-    
-    Args:
-        installer_path: Path to installer .exe
-        product: Product name
-    
-    Returns:
-        Tuple of (success, message)
-    """
-    installer = AffinityInstaller()
-    return installer.install_affinity_product(installer_path, product)
-
-
-def list_installed() -> List[str]:
-    """
-    Simple interface: List installed products
-    
-    Returns:
-        List of installed product names
-    """
-    installer = AffinityInstaller()
-    return installer.list_installed_products()
-
-
-# For testing
-if __name__ == "__main__":
-    print("=== Affinity Installer Test ===")
-    
-    try:
-        installer = AffinityInstaller()
-        
-        print(f"\nWine prefix: {installer.prefix_path}")
-        print(f"Wine path: {installer.wine_path}")
-        
-        print("\n=== Checking Installed Products ===")
-        installed = installer.list_installed_products()
-        
-        if installed:
-            print(f"Found {len(installed)} installed product(s):")
-            for product in installed:
-                product_name = config.AFFINITY_PRODUCTS[product]["name"]
-                product_path = installer.get_product_path(product)
-                print(f"  ✓ {product_name}")
-                print(f"    Path: {product_path}")
-        else:
-            print("No Affinity products installed yet")
-    
-    except RuntimeError as e:
-        print(f"✗ Error: {e}")
+        return None
